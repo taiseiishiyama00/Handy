@@ -46,7 +46,7 @@ jobs:
     with:
       platform: "windows-latest"
       target: "x86_64-pc-windows-msvc"
-      build-args: "--bundles nsis --config src-tauri/tauri.fork.conf.json"
+      build-args: "--config src-tauri/tauri.fork.conf.json"
       sign-binaries: false
       asset-prefix: "handy"
       upload-artifacts: false
