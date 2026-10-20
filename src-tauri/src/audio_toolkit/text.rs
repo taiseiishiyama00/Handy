@@ -320,6 +320,125 @@ fn gated_filler_words_for_language(lang: &str) -> &'static [&'static str] {
     }
 }
 
+/// Japanese hesitation fillers. Every entry is kana-only, so it cannot match
+/// text in another language, and none is a word on its own: demonstratives
+/// such as "あの"/"その", adverbs such as "まあ"/"なんか" and "えと", the start
+/// of names such as "えとう", are left out.
+const JAPANESE_FILLER_WORDS: &[&str] = &[
+    "えーっと",
+    "ええっと",
+    "えーと",
+    "ええと",
+    "えっと",
+    "えー",
+    "あのー",
+    "あのぉ",
+    "そのー",
+    "そのぉ",
+    "うーん",
+    "うーむ",
+    "んー",
+    "あー",
+];
+
+/// Characters that end a phrase before a Japanese filler. Japanese has no
+/// spaces between words, so `\b` cannot delimit a filler there.
+const JAPANESE_PHRASE_BREAK: &str = r"\s、。，,.!?！？…";
+
+/// Whether a filler word is written in Japanese script and therefore needs
+/// [`remove_japanese_filler_words`] instead of `\b` matching.
+fn is_japanese_script(word: &str) -> bool {
+    word.chars().any(|c| {
+        matches!(c,
+            '\u{3040}'..='\u{309F}' // Hiragana
+            | '\u{30A0}'..='\u{30FF}' // Katakana, including the long mark "ー"
+            | '\u{4E00}'..='\u{9FFF}' // CJK unified ideographs
+        )
+    })
+}
+
+/// Sentence-ending marks that can follow a Japanese filler.
+const JAPANESE_SENTENCE_END: &[char] = &['。', '.', '!', '?', '！', '？'];
+
+/// Builds the matcher for Japanese fillers: the phrase break before the filler
+/// (`pre`), the filler itself, and a comma, sentence end or spacing after it
+/// (`sep`). Longer words come first so "えーっと" wins over "えー".
+fn japanese_filler_pattern(words: &[&str]) -> Option<Regex> {
+    if words.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<&str> = words.to_vec();
+    sorted.sort_by_key(|word| std::cmp::Reverse(word.chars().count()));
+    let alternation = sorted
+        .iter()
+        .map(|word| regex::escape(word))
+        .collect::<Vec<_>>()
+        .join("|");
+    Regex::new(&format!(
+        r"(?P<pre>[{JAPANESE_PHRASE_BREAK}]?)[ \t\u{{3000}}]*(?:{alternation})(?P<sep>[ \t\u{{3000}}]*[、，,。.!?！？][ \t\u{{3000}}]*|[ \t\u{{3000}}]+)?"
+    ))
+    .ok()
+}
+
+static JAPANESE_FILLER_PATTERN: Lazy<Option<Regex>> =
+    Lazy::new(|| japanese_filler_pattern(JAPANESE_FILLER_WORDS));
+
+/// Whether text appended to `kept` would start a new sentence.
+fn opens_japanese_sentence(kept: &str) -> bool {
+    kept.trim_end()
+        .chars()
+        .next_back()
+        .is_none_or(|c| JAPANESE_SENTENCE_END.contains(&c))
+}
+
+/// Deletes Japanese fillers that stand as their own phrase: preceded by the
+/// start of the text or a phrase break, or followed by punctuation. A filler
+/// glued to the words on both sides is kept, since it may be part of a word.
+fn remove_japanese_filler_words(text: &str, pattern: &Regex) -> String {
+    let mut current = text.to_string();
+    // A removal can expose the next filler of a run ("えーと、あのー、"), so
+    // repeat until nothing changes. Each pass only shortens the text.
+    loop {
+        let mut kept = String::with_capacity(current.len());
+        let mut resume = 0;
+        for caps in pattern.captures_iter(&current) {
+            let whole = caps.get(0).unwrap();
+            let pre = caps.name("pre").map_or("", |m| m.as_str());
+            let sep = caps.name("sep").map_or("", |m| m.as_str());
+            let sep_has_punctuation = sep.chars().any(|c| !c.is_whitespace());
+            if pre.is_empty() && whole.start() > 0 && !sep_has_punctuation {
+                continue;
+            }
+            kept.push_str(&current[resume..whole.start()]);
+            let pre_is_comma = matches!(pre.chars().next(), Some('、' | '，' | ','));
+            let pre_is_space = pre.chars().all(char::is_whitespace);
+            if let Some(end) = sep.chars().find(|c| JAPANESE_SENTENCE_END.contains(c)) {
+                // The filler ended a sentence: the sentence keeps its end mark
+                // ("今日は、えーと。" -> "今日は。"), while a filler that was the
+                // whole sentence goes with it ("うーん。そうですね" -> "そうですね").
+                if pre_is_comma || (pre_is_space && !opens_japanese_sentence(&kept)) {
+                    kept.push(end);
+                } else {
+                    kept.push_str(pre);
+                }
+            } else {
+                // Keep the phrase break, unless the filler closed the text and
+                // the break would be left dangling ("今日は、えーと").
+                let closes_text = current[whole.end()..].trim().is_empty();
+                if !(closes_text && pre_is_comma) {
+                    kept.push_str(pre);
+                }
+            }
+            resume = whole.end();
+        }
+        kept.push_str(&current[resume..]);
+        if kept == current {
+            return kept;
+        }
+        current = kept;
+    }
+}
+
 static MULTI_SPACE_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s{2,}").unwrap());
 
 /// Collapses repeated words (3+ repetitions) to a single instance.
@@ -408,7 +527,10 @@ fn remove_filler_matches(text: &str, pattern: &Regex) -> String {
 ///
 /// Built-in removal is two-tiered: [`UNIVERSAL_FILLER_WORDS`] apply regardless
 /// of language evidence, while [`gated_filler_words_for_language`] tokens are
-/// only removed when the output language is known. A custom list is an
+/// only removed when the output language is known. Kana-only
+/// [`JAPANESE_FILLER_WORDS`] belong to the first tier; they and any Japanese
+/// custom entries are matched by [`remove_japanese_filler_words`], since `\b`
+/// does not delimit words in Japanese. A custom list is an
 /// explicit user override and replaces both tiers without requiring language
 /// evidence. `Some(empty vec)` disables removal, preserving the legacy
 /// power-user setting. The master toggle takes precedence over both built-in
@@ -433,10 +555,32 @@ pub fn remove_filler_words(
         return text.to_string();
     }
 
+    // Japanese words cannot be delimited by `\b`, so they get their own matcher:
+    // the user's Japanese entries, or the built-in kana list, which is safe to
+    // apply without language evidence.
+    let mut filtered = match custom_filler_words {
+        Some(words) => {
+            let japanese: Vec<&str> = words
+                .iter()
+                .map(String::as_str)
+                .filter(|word| is_japanese_script(word))
+                .collect();
+            match japanese_filler_pattern(&japanese) {
+                Some(pattern) => remove_japanese_filler_words(text, &pattern),
+                None => text.to_string(),
+            }
+        }
+        None => match JAPANESE_FILLER_PATTERN.as_ref() {
+            Some(pattern) => remove_japanese_filler_words(text, pattern),
+            None => text.to_string(),
+        },
+    };
+
     // Build filler patterns from custom list or the built-in tiers
     let patterns: Vec<Regex> = match custom_filler_words {
         Some(words) => words
             .iter()
+            .filter(|word| !is_japanese_script(word))
             .filter_map(|word| Regex::new(&format!(r"(?i)\b{}\b[,.]?", regex::escape(word))).ok())
             .collect(),
         None => UNIVERSAL_FILLER_WORDS
@@ -452,7 +596,6 @@ pub fn remove_filler_words(
     };
 
     // Remove filler words
-    let mut filtered = text.to_string();
     for pattern in &patterns {
         filtered = remove_filler_matches(&filtered, pattern);
     }
@@ -783,6 +926,72 @@ mod tests {
         let result = normalize_transcription_output(&filtered);
 
         assert_eq!(result, "should be removed but um should remain");
+    }
+
+    #[test]
+    fn test_filter_japanese_fillers_between_phrases() {
+        let text = "えーと、今日は、あのー、晴れです";
+        let result = filter_transcription_output(text, "ja", &None);
+        assert_eq!(result, "今日は、晴れです");
+    }
+
+    #[test]
+    fn test_filter_japanese_filler_glued_to_following_words() {
+        // `\b` never matched here: the filler runs straight into the sentence.
+        let result = filter_transcription_output("えーっと今日は晴れ", "ja", &None);
+        assert_eq!(result, "今日は晴れ");
+    }
+
+    #[test]
+    fn test_filter_japanese_fillers_at_sentence_edges() {
+        assert_eq!(
+            filter_transcription_output("うーん。そうですね", "ja", &None),
+            "そうですね"
+        );
+        assert_eq!(
+            filter_transcription_output("今日は、えーと。次です", "ja", &None),
+            "今日は。次です"
+        );
+        assert_eq!(
+            filter_transcription_output("はい。えーと。次です", "ja", &None),
+            "はい。次です"
+        );
+        assert_eq!(
+            filter_transcription_output("今日は、えーと", "ja", &None),
+            "今日は"
+        );
+    }
+
+    #[test]
+    fn test_filter_japanese_keeps_words_and_glued_fillers() {
+        for text in [
+            "あの人は来た",
+            "まあまあです",
+            "なんか寒い",
+            "今日はえーと晴れ",
+            "ええ、そうです",
+        ] {
+            assert_eq!(filter_transcription_output(text, "ja", &None), text);
+        }
+    }
+
+    #[test]
+    fn test_filter_japanese_fillers_without_language_evidence() {
+        let filtered = remove_filler_words(
+            "えーと、テストです",
+            &OutputLanguageEvidence::Unknown,
+            &None,
+            true,
+        );
+        assert_eq!(normalize_transcription_output(&filtered), "テストです");
+    }
+
+    #[test]
+    fn test_filter_japanese_custom_filler_words() {
+        let custom = Some(vec!["なんか".to_string(), "uh".to_string()]);
+        let result = filter_transcription_output("なんか、uh 寒いですね。えーと", "ja", &custom);
+        // The custom list replaces the built-in one, so "えーと" stays.
+        assert_eq!(result, "寒いですね。えーと");
     }
 
     #[test]
