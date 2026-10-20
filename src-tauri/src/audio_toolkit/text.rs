@@ -367,21 +367,84 @@ fn japanese_filler_pattern(words: &[&str]) -> Option<Regex> {
     if words.is_empty() {
         return None;
     }
-    let mut sorted: Vec<&str> = words.to_vec();
-    sorted.sort_by_key(|word| std::cmp::Reverse(word.chars().count()));
-    let alternation = sorted
-        .iter()
-        .map(|word| regex::escape(word))
-        .collect::<Vec<_>>()
-        .join("|");
+    let alternation = longest_first_alternation(words);
     Regex::new(&format!(
         r"(?P<pre>[{JAPANESE_PHRASE_BREAK}]?)[ \t\u{{3000}}]*(?:{alternation})(?P<sep>[ \t\u{{3000}}]*[、，,。.!?！？][ \t\u{{3000}}]*|[ \t\u{{3000}}]+)?"
     ))
     .ok()
 }
 
+/// Joins `words` into a regex alternation, longest first so that "えーっと"
+/// wins over "えー".
+fn longest_first_alternation(words: &[&str]) -> String {
+    let mut sorted: Vec<&str> = words.to_vec();
+    sorted.sort_by_key(|word| std::cmp::Reverse(word.chars().count()));
+    sorted
+        .iter()
+        .map(|word| regex::escape(word))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 static JAPANESE_FILLER_PATTERN: Lazy<Option<Regex>> =
     Lazy::new(|| japanese_filler_pattern(JAPANESE_FILLER_WORDS));
+
+/// Short hesitations that are also the start of words ("ああいう", "あした"),
+/// so they are removed only where their position marks them as fillers.
+const JAPANESE_SHORT_FILLERS: &str = "ああ|あ|ええ|え|まあ";
+
+/// Polite sentence endings. Models that output no punctuation run the next
+/// sentence straight on, so an "え" right after one is a hesitation that
+/// opens the next sentence ("テストですえ次は").
+const JAPANESE_POLITE_ENDINGS: &str = "です|ます|でした|ました|でしょう|ません|ください";
+
+/// Matchers for built-in Japanese fillers in text that has no punctuation to
+/// delimit them, as some models (Fun-ASR) output.
+struct UnpunctuatedJapaneseFillers {
+    /// A short hesitation opening a run of fillers ("ああえっと").
+    short_before_filler: Regex,
+    /// A built-in filler anywhere, glued to the words around it.
+    glued: Regex,
+    /// "え" opening the sentence after a polite ending.
+    after_polite_ending: Regex,
+}
+
+static UNPUNCTUATED_JAPANESE_FILLERS: Lazy<Option<UnpunctuatedJapaneseFillers>> = Lazy::new(|| {
+    let fillers = longest_first_alternation(JAPANESE_FILLER_WORDS);
+    Some(UnpunctuatedJapaneseFillers {
+            short_before_filler: Regex::new(&format!(
+                r"(?P<pre>^|[{JAPANESE_PHRASE_BREAK}])(?:{JAPANESE_SHORT_FILLERS})(?P<next>{fillers})"
+            ))
+            .ok()?,
+            glued: Regex::new(&format!(r"(?:{fillers})(?:[ \t\u{{3000}}]*[、，,][ \t\u{{3000}}]*)?"))
+                .ok()?,
+            after_polite_ending: Regex::new(&format!(
+                r"(?P<end>{JAPANESE_POLITE_ENDINGS})(?:ええ|え)(?:[ \t\u{{3000}}]*[、，,][ \t\u{{3000}}]*)?"
+            ))
+            .ok()?,
+        })
+});
+
+/// Removes the built-in Japanese fillers: first those delimited by
+/// punctuation, which keeps the punctuation tidy, then the ones a model left
+/// glued to the surrounding words because it output no punctuation.
+fn remove_builtin_japanese_filler_words(text: &str) -> String {
+    let Some(delimited) = JAPANESE_FILLER_PATTERN.as_ref() else {
+        return text.to_string();
+    };
+    let Some(unpunctuated) = UNPUNCTUATED_JAPANESE_FILLERS.as_ref() else {
+        return remove_japanese_filler_words(text, delimited);
+    };
+    let text = unpunctuated
+        .short_before_filler
+        .replace_all(text, "${pre}${next}");
+    let text = remove_japanese_filler_words(&text, delimited);
+    let text = unpunctuated.glued.replace_all(&text, "");
+    unpunctuated
+        .after_polite_ending
+        .replace_all(&text, "${end}")
+        .into_owned()
+}
 
 /// Whether text appended to `kept` would start a new sentence.
 fn opens_japanese_sentence(kept: &str) -> bool {
@@ -570,10 +633,7 @@ pub fn remove_filler_words(
                 None => text.to_string(),
             }
         }
-        None => match JAPANESE_FILLER_PATTERN.as_ref() {
-            Some(pattern) => remove_japanese_filler_words(text, pattern),
-            None => text.to_string(),
-        },
+        None => remove_builtin_japanese_filler_words(text),
     };
 
     // Build filler patterns from custom list or the built-in tiers
@@ -963,12 +1023,11 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_japanese_keeps_words_and_glued_fillers() {
+    fn test_filter_japanese_keeps_words() {
         for text in [
             "あの人は来た",
             "まあまあです",
             "なんか寒い",
-            "今日はえーと晴れ",
             "ええ、そうです",
         ] {
             assert_eq!(filter_transcription_output(text, "ja", &None), text);
@@ -984,6 +1043,33 @@ mod tests {
             true,
         );
         assert_eq!(normalize_transcription_output(&filtered), "テストです");
+    }
+
+    #[test]
+    fn test_filter_japanese_fillers_without_punctuation() {
+        // Fun-ASR output: no punctuation delimits the fillers.
+        let text =
+            "ああえっとえっとテストですえテストをしておりますえどのように変換されるでしょうか";
+        assert_eq!(
+            filter_transcription_output(text, "ja", &None),
+            "テストですテストをしておりますどのように変換されるでしょうか"
+        );
+        assert_eq!(
+            filter_transcription_output("今日はえーと晴れです", "ja", &None),
+            "今日は晴れです"
+        );
+    }
+
+    #[test]
+    fn test_filter_japanese_keeps_short_fillers_that_start_words() {
+        for text in [
+            "ああいう話です",
+            "あしたは晴れ",
+            "ええ、そうです",
+            "あの人は来た",
+        ] {
+            assert_eq!(filter_transcription_output(text, "ja", &None), text);
+        }
     }
 
     #[test]
